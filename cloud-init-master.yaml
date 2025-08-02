@@ -1,0 +1,51 @@
+#cloud-config
+packages:
+  - curl
+  - openssh-client
+
+users:
+  - name: cluster
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGLd1np6r1I8lnTMg6Fkxf5jSa7AcqhPAx+Wxzrv/TWn lunaticcoding@MacBookPro.fritz.box
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBU9OCltzUcn5bmkF+orwn55Tb3jKk0stBZI9OXnoxcG lunaticcoding@MacBookPro.fritz.box
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+
+write_files:
+  - path: /home/cluster/.ssh/id_ed25519
+    content: ${base64encode(inter_node_private_key)}
+    owner: cluster:cluster
+    permissions: '0600'
+  - path: /home/cluster/.ssh/config
+    content: |
+      Host *
+          StrictHostKeyChecking no
+          UserKnownHostsFile /dev/null
+    owner: cluster:cluster
+    permissions: '0600'
+  - path: /etc/systemd/system/k3s.service.d/10-opts.conf
+    permissions: "0644"
+    content: |
+      [Service]
+      Environment="K3S_TOKEN=${k3s_token}"
+      Environment="INSTALL_K3S_EXEC=server --node-ip 10.0.1.1 --tls-san 10.0.1.1 --write-kubeconfig-mode 0644"
+
+bootcmd:
+  - swapoff -a || true
+  - sed -ri 's@^([^#].*\s+swap\s+.*)$@# \1@' /etc/fstab || true
+  - rm -f /swapfile || true
+
+runcmd:
+  - apt-get update -y
+  - |
+    set -e
+    for u in $(systemctl list-units --type=swap --no-legend | awk '{print $1}'); do
+      systemctl mask "$u" || true
+    done
+    echo 'vm.swappiness=0' > /etc/sysctl.d/99-disable-swap.conf
+    sysctl --system
+  - curl https://get.k3s.io | K3S_TOKEN=${k3s_token} INSTALL_K3S_EXEC="--disable traefik --disable-cloud-controller --kubelet-arg cloud-provider=external" sh -
+  - systemctl daemon-reload
+  - systemctl enable --now k3s
+  - chown cluster:cluster /etc/rancher/k3s/k3s.yaml
+  - chown cluster:cluster /var/lib/rancher/k3s/server/node-token
