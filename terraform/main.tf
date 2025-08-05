@@ -167,7 +167,7 @@ resource "hcloud_server" "master-node" {
 
   user_data = templatefile("${path.module}/cloud-init-master.yaml", {
     inter_node_private_key = local.inter_node_private_key,
-    k3s_token            = random_password.k3s_token.result
+    k3s_token            = random_password.k3s_token.result,
     master_private_ip     = local.master_private_ip,
   })
 
@@ -211,6 +211,11 @@ resource "hcloud_load_balancer" "k3s_lb" {
   location           = "fsn1"
 }
 
+resource "hcloud_load_balancer_network" "lb_net" {
+  load_balancer_id = hcloud_load_balancer.k3s_lb.id
+  network_id       = hcloud_network.private_network.id
+}
+
 # Attach all worker nodes to load balancer
 resource "hcloud_load_balancer_target" "worker_targets" {
   count            = 3
@@ -218,6 +223,8 @@ resource "hcloud_load_balancer_target" "worker_targets" {
   load_balancer_id = hcloud_load_balancer.k3s_lb.id
   server_id        = hcloud_server.worker-nodes[count.index].id
   use_private_ip = true
+
+  depends_on = [hcloud_load_balancer_network.lb_net]
 }
 
 # HTTP service (port 80)
