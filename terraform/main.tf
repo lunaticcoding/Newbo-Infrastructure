@@ -39,6 +39,8 @@ variable "admin_cidrs" {
 
 locals {
   inter_node_private_key = file(pathexpand(var.inter_node_private_key_path))
+  master_private_ip = "10.0.1.1"
+
 }
 
 resource "hcloud_network" "private_network" {
@@ -56,6 +58,24 @@ resource "hcloud_network_subnet" "private_network_subnet" {
 ############################################
 # Firewalls (absolute minimum)
 ############################################
+# Load Balancer firewall
+resource "hcloud_firewall" "k3s_lb" {
+  name = "k3s-lb-firewall"
+
+  rule {
+    direction  = "in"
+    protocol   = "tcp"
+    port       = "80"
+    source_ips = ["0.0.0.0/0"]  # Allow all incoming HTTP traffic
+  }
+
+  rule {
+    direction  = "in"
+    protocol   = "tcp"
+    port       = "443"
+    source_ips = ["0.0.0.0/0"]  # Allow all incoming HTTPS traffic
+  }
+}
 
 # Master / server firewall
 resource "hcloud_firewall" "k3s_master" {
@@ -142,12 +162,13 @@ resource "hcloud_server" "master-node" {
     network_id = hcloud_network.private_network.id
     # IP Used by the master node, needs to be static
     # Here the worker nodes will use 10.0.1.1 to communicate with the master node
-    ip         = "10.0.1.1"
+    ip         = local.master_private_ip
   }
 
   user_data = templatefile("${path.module}/cloud-init-master.yaml", {
     inter_node_private_key = local.inter_node_private_key,
     k3s_token            = random_password.k3s_token.result
+    master_private_ip     = local.master_private_ip,
   })
 
   depends_on = [hcloud_network_subnet.private_network_subnet, local.inter_node_private_key]
@@ -167,7 +188,10 @@ resource "hcloud_server" "worker-nodes" {
 
   ssh_keys = ["Newbo Terraform Key | Marco Papula"]
 
-  firewall_ids = [hcloud_firewall.k3s_worker.id]
+  firewall_ids = [
+    hcloud_firewall.k3s_worker.id,
+    hcloud_firewall.k3s_lb.id
+  ]
 
   network {
     network_id = hcloud_network.private_network.id
@@ -175,8 +199,70 @@ resource "hcloud_server" "worker-nodes" {
   user_data = templatefile("${path.module}/cloud-init-worker.yaml", {
     inter_node_private_key = local.inter_node_private_key,
     k3s_token            = random_password.k3s_token.result
+    master_private_ip     = local.master_private_ip
   })
 
   depends_on = [hcloud_network_subnet.private_network_subnet, hcloud_server.master-node, local.inter_node_private_key]
 }
 
+resource "hcloud_load_balancer" "k3s_lb" {
+  name               = "k3s-load-balancer"
+  load_balancer_type = "lb11"
+  location           = "fsn1"
+}
+
+# Attach all worker nodes to load balancer
+resource "hcloud_load_balancer_target" "worker_targets" {
+  count            = 3
+  type             = "server"
+  load_balancer_id = hcloud_load_balancer.k3s_lb.id
+  server_id        = hcloud_server.worker-nodes[count.index].id
+  use_private_ip = true
+}
+
+# HTTP service (port 80)
+resource "hcloud_load_balancer_service" "http" {
+  load_balancer_id = hcloud_load_balancer.k3s_lb.id
+  protocol         = "http"
+  listen_port      = 80
+  destination_port = 80
+  proxyprotocol = true
+
+  health_check {
+    protocol = "http"
+    port     = 80
+    interval = 15
+    timeout  = 10
+    retries  = 3
+    http {
+      path = "/"
+    }
+  }
+}
+
+# HTTPS service (port 443)
+resource "hcloud_load_balancer_service" "https" {
+  load_balancer_id = hcloud_load_balancer.k3s_lb.id
+  protocol         = "tcp"
+  listen_port      = 443
+  destination_port = 443
+  proxyprotocol = true
+
+  health_check {
+    protocol = "tcp"
+    port     = 443
+    interval = 15
+    timeout  = 10
+    retries  = 3
+  }
+}
+
+output "load_balancer_ip" {
+  value = hcloud_load_balancer.k3s_lb.ipv4
+  description = "IP address of the Hetzner Cloud Load Balancer - point your DNS here"
+}
+
+output "load_balancer_ipv6" {
+  value = hcloud_load_balancer.k3s_lb.ipv6
+  description = "IPv6 address of the Hetzner Cloud Load Balancer"
+}
